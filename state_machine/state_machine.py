@@ -9,7 +9,6 @@ from geometry_msgs.msg import Pose2D, Point, PointStamped, PoseWithCovariance, P
 from builtin_interfaces.msg import Time
 from std_srvs.srv import Empty
 
-
 import numpy as np
 from collections.abc import Callable
 from collections import deque
@@ -18,12 +17,22 @@ from enum import Enum
 import time
 
 class State(Enum):
-    STOW = "STOW"
-    MOVE_ARM = "MOVE_ARM" # move manipulator from pt to pt
-    MOVE_GRIPPER = "MOVE_GRIPPER" # lower gripper to depth, open/close, raise gripper
+    IDLE = "IDLE"
+    VALIDATE_MOVE = "VALIDATE_MOVE"
+    MOVE_TO_START = "MOVE_TO_START"
+    LOWER_FOR_GRASP = "LOWER_FOR_GRASP"
+    SELECT_GRIPPER = "SELECT_GRIPPER"
+    CLOSE_GRIPPER = "CLOSE_GRIPPER"
+    LIFT_FROM_START = "LIFT_FROM_START"
+    MOVE_TO_GOAL = "MOVE_TO_GOAL"
+    LOWER_FOR_RELEASE = "LOWER_FOR_RELEASE"
+    OPEN_GRIPPER = "OPEN_GRIPPER"
+    LIFT_FROM_GOAL = "LIFT_FROM_GOAL"
+    STOW_ARM = "STOW_ARM"
+    ERROR = "ERROR"
     
 # launch using the: ros2 launch state_machine state_machine
-# manually set state: ros2 topic pub -1 /set_state std_msgs/msg/String "{data: 'SEARCH'}"
+# manually set state: ros2 topic pub -1 /set_state std_msgs/msg/String "{data: 'IDLE'}"
 
 class StateManager(Node):
 
@@ -34,19 +43,27 @@ class StateManager(Node):
 
         ### DETECTION TOPICS --------------------------------------------------
 
-        # Topic for sending selected object centroid to VBM TODO start, goal centroids
-        self.declare_parameter('centroid_topic', 'selected_centroid')
+        # Topic for sending selected object centroid to VBM
+        self.declare_parameter('start_centroid_topic', 'start_centroid')
+        self.declare_parameter('goal_centroid_topic', 'goal_centroid')
 
-        # Topic for receiving 3D point from VBM
-        self.declare_parameter('vbm_extract_topic', 'extract_centroid')
+        # Topics for receiving 3D points from VBM
+        self.declare_parameter('start_extract_topic', 'extract_start_centroid')
+        self.declare_parameter('goal_extract_topic', 'extract_goal_centroid')
 
         ### ARM TOPICS --------------------------------------------------------
 
         # Topic for sending gripper to move
         self.declare_parameter('grasp_command_topic', 'force_grasp')
 
-        # Topic for sending arm commands to move on trajectories and potentiall to grasp
+        # Topic for sending elevator commands
+        self.declare_parameter('elevator_command_topic', 'elevator_command')
+
+        # Topic for sending arm commands to move on trajectories
         self.declare_parameter('arm_command_topic', 'move_arm_command')
+
+        # Topic for selecting gripper
+        self.declare_parameter('gripper_select_topic', 'select_gripper')
 
         # CustomArmMsg from Arm Node
         self.declare_parameter('arm_status_topic', 'arm_status')
@@ -55,77 +72,101 @@ class StateManager(Node):
         self.declare_parameter('arm_stow_service_topic', 'stow_arm')
 
         # Topic for Unstow Service Call to Arm Node
-        self.declare_parameter('arm_unstow_service_topic', 'unstow_arm') # TODO check if needed
+        self.declare_parameter('arm_unstow_service_topic', 'unstow_arm')
 
         ### STATE TOPICS --------------------------------------------------
         
         # Topic to send state information
         self.declare_parameter('state_topic','state')
 
+        # Topic to receive state commands
         self.declare_parameter('state_setter_topic', 'set_state')
         
         # -----
-        # SERVICES
-
-        # self.in_range_service = self.create_client(Bool, self.get_parameter('arm_grasp_topic').value) # TODO fix or delete
-
-        # -----
         # DEBUG
-        self.declare_parameter('override_errors',False)
+        self.declare_parameter('override_errors', False)
         self.declare_parameter('debug', 0b11111)
         self.override_errors = self.get_parameter('override_errors').value
         debug = self.get_parameter('debug').value
         self.debug_publish  = bool(debug & 0b10000)
-        # self.debug_xxxxx    = bool(debug & 0b01000)
-        # self.debug_detect   = bool(debug & 0b00100)
+        self.debug_xxxxx    = bool(debug & 0b01000)
+        self.debug_detect   = bool(debug & 0b00100)
         self.debug_vbm      = bool(debug & 0b00010)
         self.debug_arm      = bool(debug & 0b00001)
-        self.get_logger().info(f"Debug Flags: Publish: {self.debug_publish}, XXXXX {self.debug_xxxxx},"+
-                               f" Detection {self.debug_detect}, VBM {self.debug_vbm}, Arm {self.debug_arm}")
+        self.get_logger().info(f"Debug Flags: Publish: {self.debug_publish}, XXXXX: {self.debug_xxxxx},"+
+                               f" Detection: {self.debug_detect}, VBM: {self.debug_vbm}, Arm: {self.debug_arm}")
+        
         # INITIAL STATE
-        self._state = State.STOW
-        self._received_state = State.STOW
-        self._extract_pt = PointStamped()
+        self._state = State.IDLE
+        self._received_state = State.IDLE
+        self._start_extract_pt = PointStamped()
+        self._goal_extract_pt = PointStamped()
         self._arm_status = ArmStatus()    
 
         # STORE PREVIOUS MESSAGE SENT PER TOPIC
         self.last_sent_messages = {}
         self.msg_timeout = 3
 
-        # waiting, stowing, unstowing state variables
-        self.next_state = State.MOVE_ARM
-        self.start = True # whether moving to start (True) or goal (False), toggles after move_arm
-
+        # State machine progress variables
+        self.gripper_selection = "pinch"  # Gripper mode (choices: "pinch", "suction")
+        self.gripper_threshold = 0.02 # Height above start piece in cm to switch gripper module
+        self.movement_time = 1.0  # Default movement time in seconds
+        self.approach_height = 0.05  # Height above target for approach
+        self.grasp_tolerance = 0.01  # Position tolerance for grasping
+        self.move_timeout = 5.0  # Timeout for arm movements
+        self.last_operation_time = time.time()
+        
         # SUBSCRIBERS
+        self.state_setter_subscriber = self.create_subscription(
+            String, 
+            self.get_parameter('state_setter_topic').value, 
+            self.receive_desired_state, 10)
+        
+        self.start_extract_subscriber = self.create_subscription(
+            PointStamped,
+            self.get_parameter('start_extract_topic').value,
+            self.get_setter("start_extract_pt"), 10)
+            
+        self.goal_extract_subscriber = self.create_subscription(
+            PointStamped,
+            self.get_parameter('goal_extract_topic').value,
+            self.get_setter("goal_extract_pt"), 10)
 
-        self.state_setter_subscriber = self.create_subscription(String, 
-                                            self.get_parameter('state_setter_topic').value, 
-                                            self.receive_desired_state, 10)
-        # TODO start + goal pts
-        self.extract_subscriber = self.create_subscription(PointStamped,
-                                                    self.get_parameter('vbm_extract_topic').value,
-                                                    self.get_setter("extract_pt"), 10)
-
-        self.arm_status_subscriber = self.create_subscription(ArmStatus, 
-                                                    self.get_parameter('arm_status_topic').value, 
-                                                    self.get_setter("arm_status"), 10)
+        self.arm_status_subscriber = self.create_subscription(
+            ArmStatus, 
+            self.get_parameter('arm_status_topic').value, 
+            self.get_setter("arm_status"), 10)
 
         # STOW ARM SERVICE CLIENT
         self.stow_arm_client = self.create_client(Empty, self.get_parameter('arm_stow_service_topic').value)
         self.unstow_arm_client = self.create_client(Empty, self.get_parameter('arm_unstow_service_topic').value)
 
         # PUBLISHERS
-        self.force_grasp_publisher = self.create_publisher(Bool, 
-                                                    self.get_parameter('grasp_command_topic').value, 10)
-        self.arm_command_publisher = self.create_publisher(ArmCommand, 
-                                                    self.get_parameter('arm_command_topic').value, 10)
-        self.state_publisher = self.create_publisher(String,
-                                                    self.get_parameter('state_topic').value, 10)
+        self.force_grasp_publisher = self.create_publisher(
+            Bool, 
+            self.get_parameter('grasp_command_topic').value, 10)
+            
+        self.arm_command_publisher = self.create_publisher(
+            ArmCommand, 
+            self.get_parameter('arm_command_topic').value, 10)
+            
+        self.state_publisher = self.create_publisher(
+            String,
+            self.get_parameter('state_topic').value, 10)
+            
+        self.elevator_command_publisher = self.create_publisher( # TODO
+            Bool,
+            self.get_parameter('elevator_command_topic').value, 10)
+            
+        self.gripper_select_publisher = self.create_publisher( # TODO
+            String,
+            self.get_parameter('gripper_select_topic').value, 10)
                 
-        # new needs to exist for the properties but needs the subscribers to exist as well
+        # Initialize tracking of new data from subscribers
         self.received_new = {
             self.state_setter_subscriber.topic: False,
-            self.extract_subscriber.topic: False,
+            self.start_extract_subscriber.topic: False,
+            self.goal_extract_subscriber.topic: False,
             self.arm_status_subscriber.topic: False,
         }  
 
@@ -169,19 +210,29 @@ class StateManager(Node):
         try:
             string = ros_msg.data
             self.received_state = State(string)
-            self.debug(True, f"State changed queued from incoming message: {string, self._received_state}")
+            self.debug(True, f"State change queued from incoming message: {string, self._received_state}")
         except ValueError:
             self.debug(True, f"[WARNING] No matching state for string: {string}")
 
     @property
-    def extract_pt(self) -> PointStamped:
-        self.received_new[self.extract_subscriber.topic] = False
-        return self._extract_pt
+    def start_extract_pt(self) -> PointStamped:
+        self.received_new[self.start_extract_subscriber.topic] = False
+        return self._start_extract_pt
     
-    @extract_pt.setter
-    def extract_pt(self, ros_msg: PointStamped) -> None:
-        self.received_new[self.extract_subscriber.topic] = True
-        self._extract_pt = ros_msg
+    @start_extract_pt.setter
+    def start_extract_pt(self, ros_msg: PointStamped) -> None:
+        self.received_new[self.start_extract_subscriber.topic] = True
+        self._start_extract_pt = ros_msg
+        
+    @property
+    def goal_extract_pt(self) -> PointStamped:
+        self.received_new[self.goal_extract_subscriber.topic] = False
+        return self._goal_extract_pt
+    
+    @goal_extract_pt.setter
+    def goal_extract_pt(self, ros_msg: PointStamped) -> None:
+        self.received_new[self.goal_extract_subscriber.topic] = True
+        self._goal_extract_pt = ros_msg
 
     @property
     def arm_status(self) -> ArmStatus:
@@ -238,8 +289,20 @@ class StateManager(Node):
         if if_debug:
             # Node name, topic, message, extra debug info (if present)
             self.get_logger().info(string)
+            
+    def is_timeout_expired(self, timeout_duration: float) -> bool:
+        '''
+        Returns True if more than timeout_duration seconds have passed since last_operation_time
+        '''
+        return (time.time() - self.last_operation_time) > timeout_duration
 
-# ----- STOW FNs
+    def reset_timeout(self) -> None:
+        '''
+        Reset the operation timeout timer
+        '''
+        self.last_operation_time = time.time()
+
+# ----- ARM SERVICE FUNCTIONS
     def stow_arm(self):
         # Call the stow_arm service
         self.get_logger().info('Calling stow_arm service...')
@@ -254,6 +317,7 @@ class StateManager(Node):
                 return "Stow Service Failure"
 
         future.add_done_callback(lambda response: self.debug(self.debug_arm, service_debug_message(response)))
+        self.reset_timeout()
     
     def unstow_arm(self):
         # Call the unstow_arm service
@@ -269,137 +333,368 @@ class StateManager(Node):
                 return "Unstow Service Failure"
 
         future.add_done_callback(lambda response: self.debug(self.debug_arm, service_debug_message(response)))
+        self.reset_timeout()
 
-# ----- ARM HELPERS
-    # TODO select gripper mode
-    def openGripper(self):
+# ----- ARM CONTROL FUNCTIONS
+    def openGripper(self): # TODO
         '''send ROSmsg to arm control node to open gripper'''
-        self.publish_helper(self.force_grasp_publisher, Bool(data=True))
-
-    
-    def closeGripper(self):
-        '''send ROSmsg to arm control node to close gripper'''
         self.publish_helper(self.force_grasp_publisher, Bool(data=False))
+        self.reset_timeout()
+    
+    def closeGripper(self): # TODO
+        '''send ROSmsg to arm control node to close gripper'''
+        self.publish_helper(self.force_grasp_publisher, Bool(data=True))
+        self.reset_timeout()
+        
+    def selectGripper(self, gripper_type: str): # TODO
+        '''send ROSmsg to select gripper type (suction or pinch)'''
+        self.publish_helper(self.gripper_select_publisher, String(data=gripper_type))
+        self.gripper_selection = gripper_type
+        self.reset_timeout()
+        
+    def moveElevator(self, lower: bool): # TODO
+        '''send ROSmsg to control elevator (True for lower, False for raise)'''
+        self.publish_helper(self.elevator_command_publisher, Bool(data=lower))
+        self.reset_timeout()
 
-
-    def sendArmCommand(self, poseStampedMsg:PoseStamped, task_space:str="track", 
-                       grasp_at_end_of_movement:bool=False, movement_time:float=1.0) -> None:
+    def sendArmCommand(self, poseStampedMsg: PoseStamped, task_space: str = "track", 
+                      grasp_at_end_of_movement: bool = False, movement_time: float = None) -> None:
         '''send ROSmsg to arm control node with a point'''
+        if movement_time is None:
+            movement_time = self.movement_time
+            
         msg = ArmCommand()
         msg.goal.x = poseStampedMsg.pose.position.x
         msg.goal.y = poseStampedMsg.pose.position.y
         msg.goal.z = poseStampedMsg.pose.position.z
-        msg.tolerance = 0.05 # meters, this is the default tolerance for arm movement
-        msg.grasp_at_end_of_movement = grasp_at_end_of_movement # use the parameter for grasping
-        msg.trajectory_mode = task_space # task space or joint space 
-        msg.movement_time = movement_time # seconds to complete the movement, default is 1.0s
-        self.publish_helper(self.arm_command_publisher,msg) # publish the poseStamped to the arm command topic
-    
+        msg.tolerance = self.grasp_tolerance
+        msg.grasp_at_end_of_movement = grasp_at_end_of_movement
+        msg.trajectory_mode = task_space
+        msg.movement_time = movement_time
+        self.publish_helper(self.arm_command_publisher, msg)
+        self.reset_timeout()
+        
+    def calculatePositionDifference(self, target_pose: PoseStamped) -> float:
+        '''
+        Calculate the Euclidean distance between the current end effector position 
+        and the target position
+        '''
+        diffx = self.arm_status.ee_pos.x - target_pose.pose.position.x
+        diffy = self.arm_status.ee_pos.y - target_pose.pose.position.y 
+        diffz = self.arm_status.ee_pos.z - target_pose.pose.position.z
+        return math.sqrt(diffx**2 + diffy**2 + diffz**2)
+        
+    def isArmAtPosition(self, target_pose: PoseStamped) -> bool:
+        '''
+        Returns True if the arm is at the target position within tolerance
+        '''
+        return self.calculatePositionDifference(target_pose) <= self.grasp_tolerance
+        
+    def createElevatedPose(self, base_point: PointStamped) -> PoseStamped:
+        '''
+        Create a PoseStamped at the approach position above the target point
+        '''
+        elevated_pose = PoseStamped()
+        elevated_pose.header = base_point.header
+        elevated_pose.pose.position.x = base_point.point.x
+        elevated_pose.pose.position.y = base_point.point.y
+        elevated_pose.pose.position.z = base_point.point.z + self.approach_height #TODO
+        return elevated_pose
+        
+    def createGraspPose(self, base_point: PointStamped) -> PoseStamped:
+        '''
+        Create a PoseStamped at the grasp position
+        '''
+        grasp_pose = PoseStamped()
+        grasp_pose.header = base_point.header
+        grasp_pose.pose.position.x = base_point.point.x
+        grasp_pose.pose.position.y = base_point.point.y
+        grasp_pose.pose.position.z = base_point.point.z
+        return grasp_pose
+
 # ----------- STATE FUNCTIONS
-# ----- MOVE_ARM
-    def move_arm(self) -> State:
+    
+    def validateMove(self) -> State:
         '''
-        this loops when move_arm is current state
-        no input, outputs State
+        Check if we have both start and goal points
         '''
-        # calculate grasp
-        # generate posestamped message from grasp    
-        
-        pt_subscriber = self.extract_subscriber if self.start else self.extract_subscriber # TODO check that start and end points received somewhere in state machine
-
-        
-        if self.is_new_data_from_subscriber(pt_subscriber): 
-            point = self.extract_pt if self.start else self.extract_pt # TODO
-            pt = PoseStamped()
-            pt.header = point.header
-            pt.pose.position = point.point
-             
-            diffx = self.arm_status.ee_pos.x - pt.pose.position.x
-            diffy = self.arm_status.ee_pos.y - pt.pose.position.y 
-            diffz = self.arm_status.ee_pos.z - pt.pose.position.z
-            posDiff = math.sqrt(diffx**2 + diffy**2 + diffz**2)
+        if not self.is_new_data_from_subscriber(self.start_extract_subscriber):
+            self.debug(self.debug_vbm, "Waiting for start point data")
+            return State.VALIDATE_MOVE
             
-            # send the grasp command to the arm
-            self.sendArmCommand(pt, task_space="track", grasp_at_end_of_movement=True)
-
-            self.debug(self.debug_arm, f"Position difference between armPos and setpoint: {posDiff}")
-        
-            if self.arm_status.grasping_object == True:
-                self.debug(self.debug_arm, f'grasp successful, moving to next state')
-                return State.MOVE_GRIPPER
-        
-        return State.MOVE_ARM 
-
-# ----- MOVE_GRIPPER
-    def move_gripper(self) -> State:
-        '''
-        this loops when move_gripper is current state
-        no input, outputs State
-        '''
-        # lower gripper, open/close, raise gripper
-        
-        pt_subscriber = self.extract_subscriber if self.start else self.extract_subscriber # TODO check that start and end points received somewhere in state machine
-
-        
-        if self.is_new_data_from_subscriber(pt_subscriber): 
-            point = self.extract_pt if self.start else self.extract_pt # TODO
-            pt = PoseStamped()
-            pt.header = point.header
-            pt.pose.position = point.point
-             
-            diffx = self.arm_status.ee_pos.x - pt.pose.position.x
-            diffy = self.arm_status.ee_pos.y - pt.pose.position.y 
-            diffz = self.arm_status.ee_pos.z - pt.pose.position.z
-            posDiff = math.sqrt(diffx**2 + diffy**2 + diffz**2)
+        if not self.is_new_data_from_subscriber(self.goal_extract_subscriber):
+            self.debug(self.debug_vbm, "Waiting for goal point data")
+            return State.VALIDATE_MOVE
             
-            # send the grasp command to the arm
-            # self.sendArmCommand(pt, task_space="track", grasp_at_end_of_movement=True)
-            # sendElevatorCommand(lower if self.start else raise) # TODO implement raise/lower function that returns whether reached position status
-            if self.arm_status.elevator == True: # TODO implement status for elevator reaching a goal
-                self.closeGripper() if self.start else self.openGripper() # TODO implement return status and switch grippers depending on depth
-                if self.arm_status.gripper == True:
-                    # self.sendElevatorCommand(raise if self.start else lower) # TODO implement 
-                    pass
-
-
-            self.debug(self.debug_arm, f"Position difference between armPos and setpoint: {posDiff}")
+        self.debug(self.debug_vbm, "Move validated, proceed to unstow and move to start")
+        self.unstow_arm()
+        return State.MOVE_TO_START
         
-            if self.arm_status.grasping_object == True: # TODO change to elevator/gripper routine finished
-                self.debug(self.debug_arm, f'grasp successful, moving to next state')
-                return State.MOVE_ARM if self.start else State.STOW
+    def moveToStart(self) -> State:
+        '''
+        Move arm to position above the start position
+        '''
+        elevated_pose = self.createElevatedPose(self.start_extract_pt)
+        self.sendArmCommand(elevated_pose, task_space="track")
         
-        return State.MOVE_GRIPPER
+        # Check if we've reached the position
+        if self.isArmAtPosition(elevated_pose):
+            self.debug(self.debug_arm, "Reached start position")
+            return State.LOWER_FOR_GRASP
+            
+        # Check for timeout
+        if self.is_timeout_expired(self.move_timeout):
+            self.debug(self.debug_arm, "Timeout moving to start position")
+            return State.ERROR
+            
+        return State.MOVE_TO_START
+        
+    def lowerForGrasp(self) -> State:
+        '''
+        Lower the arm to grasp position
+        '''
+        grasp_pose = self.createGraspPose(self.start_extract_pt)
+        self.sendArmCommand(grasp_pose, task_space="track")
+        
+        # Check if we've reached the position
+        if self.isArmAtPosition(grasp_pose):
+            self.debug(self.debug_arm, "Lowered to grasp position")
+            return State.SELECT_GRIPPER
+            
+        # Check for timeout
+        if self.is_timeout_expired(self.move_timeout):
+            self.debug(self.debug_arm, "Timeout lowering for grasp")
+            return State.ERROR
+            
+        return State.LOWER_FOR_GRASP
+        
+    def selectGripperState(self) -> State:
+        '''
+        Select appropriate gripper based on detected object
+        '''
+        # This could be expanded to select between gripper types based on object properties
+        # For now, we'll use the default or make a selection based on the z-depth
+        
+        # I.e. if object is game piece, use pinch gripper
+        if self.start_extract_pt.point.z >= self.gripper_threshold:
+            gripper_type = "pinch"
+        else: # I.e. if object is card
+            gripper_type = "suction"
+            
+        self.selectGripper(gripper_type)
+        self.debug(self.debug_arm, f"Selected {gripper_type} gripper")
+        return State.CLOSE_GRIPPER
+        
+    def closeGripperState(self) -> State:
+        '''
+        Close gripper to grasp object
+        '''
+        self.closeGripper()
+        
+        # Check if gripper is closed and grasping object
+        if self.arm_status.grasping_object:
+            self.debug(self.debug_arm, "Object grasped")
+            return State.LIFT_FROM_START
+            
+        # Check for timeout
+        if self.is_timeout_expired(2.0):  # shorter timeout for gripper operation
+            self.debug(self.debug_arm, "Timeout closing gripper")
+            return State.ERROR
+            
+        return State.CLOSE_GRIPPER
+        
+    def liftFromStart(self) -> State:
+        '''
+        Lift arm from start position with object
+        '''
+        elevated_pose = self.createElevatedPose(self.start_extract_pt)
+        self.sendArmCommand(elevated_pose, task_space="track")
+        
+        # Check if we've reached the elevated position
+        if self.isArmAtPosition(elevated_pose):
+            self.debug(self.debug_arm, "Lifted from start position")
+            return State.MOVE_TO_GOAL
+            
+        # Check for timeout
+        if self.is_timeout_expired(self.move_timeout):
+            self.debug(self.debug_arm, "Timeout lifting from start")
+            return State.ERROR
+            
+        return State.LIFT_FROM_START
+        
+    def moveToGoal(self) -> State:
+        '''
+        Move arm to position above goal position
+        '''
+        elevated_pose = self.createElevatedPose(self.goal_extract_pt)
+        self.sendArmCommand(elevated_pose, task_space="track")
+        
+        # Check if we've reached the position
+        if self.isArmAtPosition(elevated_pose):
+            self.debug(self.debug_arm, "Reached goal position")
+            return State.LOWER_FOR_RELEASE
+            
+        # Check for timeout
+        if self.is_timeout_expired(self.move_timeout):
+            self.debug(self.debug_arm, "Timeout moving to goal position")
+            return State.ERROR
+            
+        return State.MOVE_TO_GOAL
+        
+    def lowerForRelease(self) -> State:
+        '''
+        Lower arm to release position
+        '''
+        release_pose = self.createGraspPose(self.goal_extract_pt)
+        self.sendArmCommand(release_pose, task_space="track")
+        
+        # Check if we've reached the position
+        if self.isArmAtPosition(release_pose):
+            self.debug(self.debug_arm, "Lowered to release position")
+            return State.OPEN_GRIPPER
+            
+        # Check for timeout
+        if self.is_timeout_expired(self.move_timeout):
+            self.debug(self.debug_arm, "Timeout lowering for release")
+            return State.ERROR
+            
+        return State.LOWER_FOR_RELEASE
+        
+    def openGripperState(self) -> State:
+        '''
+        Open gripper to release object
+        '''
+        self.openGripper()
+        
+        # Check if gripper is open
+        if not self.arm_status.grasping_object:
+            self.debug(self.debug_arm, "Object released")
+            return State.LIFT_FROM_GOAL
+            
+        # Check for timeout
+        if self.is_timeout_expired(2.0):  # shorter timeout for gripper operation
+            self.debug(self.debug_arm, "Timeout opening gripper")
+            return State.ERROR
+            
+        return State.OPEN_GRIPPER
+        
+    def liftFromGoal(self) -> State:
+        '''
+        Lift arm from goal position
+        '''
+        elevated_pose = self.createElevatedPose(self.goal_extract_pt)
+        self.sendArmCommand(elevated_pose, task_space="track")
+        
+        # Check if we've reached the elevated position
+        if self.isArmAtPosition(elevated_pose):
+            self.debug(self.debug_arm, "Lifted from goal position")
+            return State.STOW_ARM
+            
+        # Check for timeout
+        if self.is_timeout_expired(self.move_timeout):
+            self.debug(self.debug_arm, "Timeout lifting from goal")
+            return State.ERROR
+            
+        return State.LIFT_FROM_GOAL
+        
+    def stowArmState(self) -> State:
+        '''
+        Stow the arm
+        '''
+        self.stow_arm()
+        
+        # Check if arm is stowed
+        if self.arm_status.is_stowed:
+            self.debug(self.debug_arm, "Arm stowed")
+            return State.IDLE
+            
+        # Check for timeout
+        if self.is_timeout_expired(self.move_timeout):
+            self.debug(self.debug_arm, "Timeout stowing arm")
+            return State.ERROR
+            
+        return State.STOW_ARM
+        
+    def errorState(self) -> State:
+        '''
+        Handle error state
+        '''
+        self.debug(True, "ERROR STATE: Attempting to recover")
+        
+        # Try to stow the arm for safety
+        self.stow_arm()
+        
+        # If configured to override errors, return to idle
+        if self.override_errors:
+            self.debug(True, "Error overridden, returning to IDLE")
+            return State.IDLE
+            
+        # Stay in error state until manually reset
+        return State.ERROR
 
 # --- STATE MACHINE TRANSITION LOGIC
 
     def state_transitions(self, old_state, new_state):
-        # TODO implement or remove
-        pass
+        """
+        Handle any special logic needed when transitioning between states
+        """
+        if old_state != new_state:
+            self.debug(True, f"State transition: {old_state.value} -> {new_state.value}")
+            # Reset timeout on state transition
+            self.reset_timeout()
             
-            
+            # Handle specific transitions if needed
+            if new_state == State.IDLE:
+                # Make sure arm is stowed when returning to idle
+                if not self.arm_status.is_stowed:
+                    self.stow_arm()
 
 # ----------- MAIN LOOP
     
     def main_loop(self):
+        # Publish current state
         state_msg = String()
         state_msg.data = self.state.value
         self.publish_helper(self.state_publisher, state_msg)
 
+        # Default to maintaining current state
         new_state = self.state
 
-        if self.state == State.STOW:
-            new_state = self.stow()
-        elif self.state == State.MOVE_ARM:
-            new_state = self.move_arm(self.start)
-        elif self.state == State.MOVE_GRIPPER:
-            new_state = self.move_gripper(self.start)
+        # Execute state function based on current state
+        if self.state == State.IDLE:
+            # Idle state - wait for command
+            pass
+        elif self.state == State.VALIDATE_MOVE:
+            new_state = self.validateMove()
+        elif self.state == State.MOVE_TO_START:
+            new_state = self.moveToStart()
+        elif self.state == State.LOWER_FOR_GRASP:
+            new_state = self.lowerForGrasp()
+        elif self.state == State.SELECT_GRIPPER:
+            new_state = self.selectGripperState()
+        elif self.state == State.CLOSE_GRIPPER:
+            new_state = self.closeGripperState()
+        elif self.state == State.LIFT_FROM_START:
+            new_state = self.liftFromStart()
+        elif self.state == State.MOVE_TO_GOAL:
+            new_state = self.moveToGoal()
+        elif self.state == State.LOWER_FOR_RELEASE:
+            new_state = self.lowerForRelease()
+        elif self.state == State.OPEN_GRIPPER:
+            new_state = self.openGripperState()
+        elif self.state == State.LIFT_FROM_GOAL:
+            new_state = self.liftFromGoal()
+        elif self.state == State.STOW_ARM:
+            new_state = self.stowArmState()
+        elif self.state == State.ERROR:
+            new_state = self.errorState()
             
+        # Override with received state if there's an incoming state command
         if self.is_new_data_from_subscriber(self.state_setter_subscriber):
-            # Use new state from message if there's an incoming state
-            self.debug(self.debug_publish,f"Updating state from received message: {self.received_state}")
+            self.debug(self.debug_publish, f"Overriding state from received message: {self.received_state}")
             new_state = self.received_state
         
-        # any state transition behavior and set state
+        # Handle state transitions and update state
         self.state_transitions(self.state, new_state)     
         self.state = new_state
 
