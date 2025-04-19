@@ -4,7 +4,7 @@ from rclpy.node import Node
 
 # CV Bridge and message imports
 from std_msgs.msg import String, Bool, Header
-from interfaces.msg import ArmStatus, ArmCommand
+from arm_interfaces.msg import ArmStatus, ArmCommand
 from geometry_msgs.msg import Pose2D, Point, PointStamped, PoseWithCovariance, PoseStamped
 from builtin_interfaces.msg import Time
 from std_srvs.srv import Empty
