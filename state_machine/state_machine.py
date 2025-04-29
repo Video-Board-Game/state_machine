@@ -18,6 +18,8 @@ import time
 from board_manipulator.BoardArmNode import MoveModes, Grasps
 from arm_interfaces.msg import ArmStatus, ArmCommand
 
+# ros2 topic pub -1 /set_state std_msgs/msg/String "{data: 'VALIDATE_MOVE'}"
+
 class State(Enum):
     IDLE = "IDLE"
     VALIDATE_MOVE = "VALIDATE_MOVE"
@@ -51,8 +53,8 @@ class StateManager(Node):
         self.declare_parameter('goal_centroid_topic', 'goal_centroid')
 
         # Topics for receiving 3D points from VBM
-        self.declare_parameter('start_extract_topic', 'extract_start_centroid')
-        self.declare_parameter('goal_extract_topic', 'extract_goal_centroid')
+        self.declare_parameter('centroid_start_topic', 'extract_start_centroid')
+        self.declare_parameter('centroid_goal_topic', 'extract_goal_centroid')
 
         ### ARM TOPICS --------------------------------------------------------
         # Topic for sending arm commands to move on trajectories
@@ -112,12 +114,12 @@ class StateManager(Node):
         
         self.start_extract_subscriber = self.create_subscription(
             PointStamped,
-            self.get_parameter('start_extract_topic').value,
+            self.get_parameter('centroid_start_topic').value,
             self.get_setter("start_extract_pt"), 10)
             
         self.goal_extract_subscriber = self.create_subscription(
             PointStamped,
-            self.get_parameter('goal_extract_topic').value,
+            self.get_parameter('centroid_goal_topic').value,
             self.get_setter("goal_extract_pt"), 10)
 
         self.arm_status_subscriber = self.create_subscription(
@@ -349,9 +351,9 @@ class StateManager(Node):
         Calculate the Euclidean distance between the current end effector position 
         and the target position
         '''
-        diffx = self.arm_status.ee_pos.x - target_pose.pose.position.x
-        diffy = self.arm_status.ee_pos.y - target_pose.pose.position.y 
-        diffz = self.arm_status.ee_pos.z - target_pose.pose.position.z
+        diffx = self.arm_status.ee_pos.position.x - target_pose.pose.position.x
+        diffy = self.arm_status.ee_pos.position.y - target_pose.pose.position.y 
+        diffz = self.arm_status.ee_pos.position.z - target_pose.pose.position.z
         return math.sqrt(diffx**2 + diffy**2 + diffz**2)
         
     def isArmAtPosition(self, target_pose: PoseStamped) -> bool:
