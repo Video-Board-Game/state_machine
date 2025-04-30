@@ -103,7 +103,7 @@ class StateManager(Node):
         self.approach_height = 0.05  # Height above target for approach
         self.grasp_tolerance = 0.01  # Position tolerance for grasping
         self.move_timeout = 5.0  # Timeout for arm movements
-        self.move_mode = MoveModes.JOINT_SPACE
+        self.move_mode = MoveModes.JOINT_SPACE.value
         self.last_operation_time = time.time()
         
         # SUBSCRIBERS
@@ -321,10 +321,10 @@ class StateManager(Node):
         '''send ROSmsg to control elevator'''
         goal = self.current_pos
         goal.pose.position.z = height
-        self.sendArmCommand(goal, move_type=MoveModes.ELEVATE)
+        self.sendArmCommand(goal, move_type=MoveModes.ELEVATE.value)
 
-    def sendArmCommand(self, goal: PoseStamped = None, movement_time: float = None, grasp_type: Grasps = Grasps.OPEN, 
-                       move_type: MoveModes = MoveModes.JOINT_SPACE, tolerance: float = 0.02, alpha: float = 0.0,
+    def sendArmCommand(self, goal: PoseStamped = None, movement_time: float = None, grasp_type = Grasps.OPEN, 
+                       move_type = MoveModes.JOINT_SPACE.value, tolerance: float = 0.02, alpha: float = 0.0,
                        grasp_at_end_of_movement: bool = False) -> None: 
         '''send ROSmsg to arm control node with a point, elevator position, and/or grasp position. reset timeout'''
         if goal is None:
@@ -339,7 +339,7 @@ class StateManager(Node):
         msg.goal.z = goal.pose.position.z
         msg.tolerance = tolerance # idk if this does anything
         msg.grasp_at_end_of_movement = grasp_at_end_of_movement # idk if this does anything
-        msg.trajectory_mode = move_type.name
+        msg.trajectory_mode = move_type
         msg.alpha = alpha # idk what this does
         msg.movement_time = movement_time
         msg.grasp_type = grasp_type.name
@@ -407,7 +407,7 @@ class StateManager(Node):
         Move arm to position above the start position
         '''
         elevated_pose = self.createElevatedPose(self.start_extract_pt)
-        self.sendArmCommand(elevated_pose, move_type=MoveModes.JOINT_SPACE)
+        self.sendArmCommand(elevated_pose, move_type=MoveModes.JOINT_SPACE.value)
         
         # Check if we've reached the position
         if self.isArmAtPosition(elevated_pose):
@@ -426,7 +426,7 @@ class StateManager(Node):
         Lower the arm to grasp position
         '''
         grasp_pose = self.createGraspPose(self.start_extract_pt)
-        self.sendArmCommand(grasp_pose, move_type=MoveModes.JOINT_SPACE)
+        self.sendArmCommand(grasp_pose, move_type=MoveModes.JOINT_SPACE.value)
         
         # Check if we've reached the position
         if self.isArmAtPosition(grasp_pose):
@@ -480,7 +480,7 @@ class StateManager(Node):
         Lift arm from start position with object
         '''
         elevated_pose = self.createElevatedPose(self.start_extract_pt)
-        self.sendArmCommand(elevated_pose, move_type=MoveModes.ELEVATE)
+        self.sendArmCommand(elevated_pose, move_type=MoveModes.ELEVATE.value)
         
         # Check if we've reached the elevated position
         if self.isArmAtPosition(elevated_pose):
@@ -499,7 +499,7 @@ class StateManager(Node):
         Move arm to position above goal position
         '''
         elevated_pose = self.createElevatedPose(self.goal_extract_pt)
-        self.sendArmCommand(elevated_pose, move_type=MoveModes.JOINT_SPACE)
+        self.sendArmCommand(elevated_pose, move_type=MoveModes.JOINT_SPACE.value)
         
         # Check if we've reached the position
         if self.isArmAtPosition(elevated_pose):
@@ -518,7 +518,7 @@ class StateManager(Node):
         Lower arm to release position
         '''
         release_pose = self.createGraspPose(self.goal_extract_pt)
-        self.sendArmCommand(release_pose, move_type=MoveModes.ELEVATE)
+        self.sendArmCommand(release_pose, move_type=MoveModes.ELEVATE.value)
         
         # Check if we've reached the position
         if self.isArmAtPosition(release_pose):
@@ -555,7 +555,7 @@ class StateManager(Node):
         Lift arm from goal position
         '''
         elevated_pose = self.createElevatedPose(self.goal_extract_pt)
-        self.sendArmCommand(elevated_pose, move_type=MoveModes.ELEVATE)
+        self.sendArmCommand(elevated_pose, move_type=MoveModes.ELEVATE.value)
         
         # Check if we've reached the elevated position
         if self.isArmAtPosition(elevated_pose):
