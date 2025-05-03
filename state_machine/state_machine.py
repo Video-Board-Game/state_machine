@@ -144,8 +144,8 @@ class StateManager(Node):
             self.arm_status_subscriber.topic: False,
         }  
 
-        self.stow_joint_positions = [0.5,0.5,0.5] # TODO
-        self.unstow_joint_positions = [0.2,0.01,0.3] # TODO
+        self.stow_joint_positions = [-0.5,0.5,0.05] # TODO
+        self.unstow_joint_positions = [0.4,-0.2,0.07] # TODO
         self.current_pos = PoseStamped()
         self.current_pos.pose.position.x = self.stow_joint_positions[0]
         self.current_pos.pose.position.x = self.stow_joint_positions[1]
@@ -279,6 +279,7 @@ class StateManager(Node):
         '''
         Returns True if more than timeout_duration seconds have passed since last_operation_time
         '''
+        print(time.time() - self.last_operation_time)
         return (time.time() - self.last_operation_time) > timeout_duration
 
     def reset_timeout(self) -> None:
@@ -315,7 +316,7 @@ class StateManager(Node):
     
     def closeGripper(self):
         '''send ROSmsg to arm control node to close gripper'''
-        self.sendArmCommand(grasp_type=self.gripper_selection, move_type=MoveModes.GRIP.value, grasp_at_end_of_movement=True)
+        self.sendArmCommand(grasp_type=Grasps.SUS, move_type=MoveModes.GRIP.value, grasp_at_end_of_movement=True)
         
     def moveElevator(self, height: float):
         '''send ROSmsg to control elevator'''
@@ -332,7 +333,7 @@ class StateManager(Node):
 
         if movement_time is None:
             movement_time = self.movement_time
-            
+        
         msg = ArmCommand()
         msg.goal.x = goal.pose.position.x
         msg.goal.y = goal.pose.position.y
@@ -346,27 +347,24 @@ class StateManager(Node):
         self.publish_helper(self.arm_command_publisher, msg)
         self.reset_timeout()
         
-    def calculatePositionDifference(self, target_pose: PoseStamped, elevator: bool) -> float:
+    def calculatePositionDifference(self, target_pose: PoseStamped, arm: bool, elevator: bool) -> float:
         '''
         Calculate the Euclidean distance between the current end effector position 
         and the target position
         '''
-        diffx = self.arm_status.ee_pos.position.x - target_pose.pose.position.x
-        diffy = self.arm_status.ee_pos.position.y - target_pose.pose.position.y 
+        diffx = self.arm_status.ee_pos.position.x - target_pose.pose.position.x if arm else 0
+        diffy = self.arm_status.ee_pos.position.y - target_pose.pose.position.y if arm else 0
         diffz = self.arm_status.ee_pos.position.z - target_pose.pose.position.z if elevator else 0
         dist = math.sqrt(diffx**2 + diffy**2 + diffz**2)
-        if elevator:
-            time.sleep(2.0) # TODO
-            return True
         self.get_logger().info(f'Dist: {dist}, x: {diffx}, y: {diffy}, z: {diffz}')
         return dist
         
-    def isArmAtPosition(self, target_pose: PoseStamped, elevator: bool) -> bool:
+    def isArmAtPosition(self, target_pose: PoseStamped, arm:bool, elevator: bool) -> bool:
         '''
         Returns True if the arm is at the target position within tolerance
         '''
-        dist = self.calculatePositionDifference(target_pose, elevator)
-        return dist <= self.grasp_tolerance
+        dist = self.calculatePositionDifference(target_pose, arm, elevator)
+        return dist <= (self.grasp_tolerance *20 if  elevator else self.grasp_tolerance)
         
     def createElevatedPose(self, base_point: PointStamped) -> PoseStamped:
         '''
@@ -387,7 +385,7 @@ class StateManager(Node):
         grasp_pose.header = base_point.header
         grasp_pose.pose.position.x = base_point.point.x
         grasp_pose.pose.position.y = base_point.point.y
-        grasp_pose.pose.position.z = base_point.point.z
+        grasp_pose.pose.position.z = 0.025#base_point.point.z
         return grasp_pose
 
 # ----------- STATE FUNCTIONS
@@ -416,7 +414,7 @@ class StateManager(Node):
         self.sendArmCommand(elevated_pose, move_type=MoveModes.JOINT_SPACE.value)
         
         # Check if we've reached the position
-        if self.isArmAtPosition(elevated_pose, False):
+        if self.isArmAtPosition(elevated_pose, True, False):
             self.debug(self.debug_arm, "Reached start position")
             return State.LOWER_FOR_GRASP
             
@@ -435,7 +433,7 @@ class StateManager(Node):
         self.sendArmCommand(grasp_pose, move_type=MoveModes.ELEVATE.value)
         
         # Check if we've reached the position
-        if self.isArmAtPosition(grasp_pose, True):
+        if self.arm_status.grasping_object:#self.isArmAtPosition(grasp_pose, False, True):
             self.debug(self.debug_arm, "Lowered to grasp position")
             return State.SELECT_GRIPPER
             
@@ -470,7 +468,7 @@ class StateManager(Node):
         self.closeGripper()
         
         # Check if gripper is closed and grasping object
-        if self.arm_status.grasping_object:
+        if self.arm_status.grasping_object:#:
             self.debug(self.debug_arm, "Object grasped")
             return State.LIFT_FROM_START
             
@@ -489,7 +487,7 @@ class StateManager(Node):
         self.sendArmCommand(elevated_pose, move_type=MoveModes.ELEVATE.value)
         
         # Check if we've reached the elevated position
-        if self.isArmAtPosition(elevated_pose, True):
+        if self.arm_status.grasping_object:#self.isArmAtPosition(elevated_pose, False, True):
             self.debug(self.debug_arm, "Lifted from start position")
             return State.MOVE_TO_GOAL
             
@@ -508,7 +506,7 @@ class StateManager(Node):
         self.sendArmCommand(elevated_pose, move_type=MoveModes.JOINT_SPACE.value)
         
         # Check if we've reached the position
-        if self.isArmAtPosition(elevated_pose, False):
+        if self.isArmAtPosition(elevated_pose, True, False):
             self.debug(self.debug_arm, "Reached goal position")
             return State.LOWER_FOR_RELEASE
             
@@ -527,7 +525,7 @@ class StateManager(Node):
         self.sendArmCommand(release_pose, move_type=MoveModes.ELEVATE.value)
         
         # Check if we've reached the position
-        if self.isArmAtPosition(release_pose, True):
+        if self.arm_status.grasping_object:#self.isArmAtPosition(release_pose, False, True):
             self.debug(self.debug_arm, "Lowered to release position")
             return State.OPEN_GRIPPER
             
@@ -545,7 +543,7 @@ class StateManager(Node):
         self.openGripper()
         
         # Check if gripper is open
-        if not self.arm_status.grasping_object:
+        if self.arm_status.grasping_object:#:
             self.debug(self.debug_arm, "Object released")
             return State.LIFT_FROM_GOAL
             
@@ -564,7 +562,7 @@ class StateManager(Node):
         self.sendArmCommand(elevated_pose, move_type=MoveModes.ELEVATE.value)
         
         # Check if we've reached the elevated position
-        if self.isArmAtPosition(elevated_pose, True):
+        if self.arm_status.grasping_object:#self.isArmAtPosition(elevated_pose, False, True):
             self.debug(self.debug_arm, "Lifted from goal position")
             return State.STOW_ARM
             
@@ -582,7 +580,7 @@ class StateManager(Node):
         self.stow_arm()
         
         # Check if arm is stowed
-        if self.arm_status.is_stowed:
+        if True:
             self.debug(self.debug_arm, "Arm stowed")
             return State.IDLE
             
@@ -624,7 +622,7 @@ class StateManager(Node):
             # Handle specific transitions if needed
             if new_state == State.IDLE:
                 # Make sure arm is stowed when returning to idle
-                if not self.arm_status.is_stowed:
+                if True:
                     self.stow_arm()
 
 # ----------- MAIN LOOP
